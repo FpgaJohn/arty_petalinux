@@ -1,0 +1,467 @@
+<!-- wp:heading {"level":1} -->
+<h1>Part 2: From XSA to Booted Linux on the Arty Z7-20</h1>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>In Part 1 we built a Vivado 2024.1 block design for the Digilent Arty Z7-20 and exported a hardware description (<code>design_1_wrapper.xsa</code>). That <code>.xsa</code> is the bridge between the FPGA side of the Zynq-7000 and the software side — it tells PetaLinux where every AXI peripheral lives, which interrupts are wired, and what the processor system looks like. In this article we turn that file into a booting Linux distribution on an SD card, wire up the board, and log in over a serial console.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Everything below assumes PetaLinux 2024.1 on an Ubuntu-family host and a Digilent Arty Z7-20 (Xilinx XC7Z020). The same flow works for the Arty Z7-10 with a different <code>.xsa</code>.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>Prerequisites</h2>
+<!-- /wp:heading -->
+
+<!-- wp:list -->
+<ul>
+<li>PetaLinux 2024.1 installed under <code>/tools/Xilinx/PetaLinux/2024.1</code> (adjust paths if yours differs).</li>
+<li>A <code>design_1_wrapper.xsa</code> from Part 1, containing at least the peripherals you want to drive from Linux.</li>
+<li>A microSD card (8 GB or larger, Class 10 recommended).</li>
+<li>A USB micro-B cable — the Arty Z7-20 uses a single USB connection for both JTAG and UART through an FTDI FT2232HQ.</li>
+<li>PuTTY (Windows) or <code>minicom</code>/<code>picocom</code>/<code>screen</code> (Linux/macOS).</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:heading -->
+<h2>1. Source the PetaLinux tools</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Every PetaLinux command needs the tool environment loaded first. Open a fresh shell and run:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>. /tools/Xilinx/PetaLinux/2024.1/settings.sh</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>If you close this terminal you will need to source <code>settings.sh</code> again in the next one. A common mistake is running <code>petalinux-build</code> in a new window and getting "command not found" — that just means you forgot this step.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>2. Create the PetaLinux project</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Place your <code>design_1_wrapper.xsa</code> somewhere convenient — say <code>~/work/arty_petalinux/</code> — and create a new project alongside it:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>cd ~/work/arty_petalinux
+petalinux-create project --template zynq --name arty_demo
+cd arty_demo</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>The <code>--template zynq</code> flag matters: it selects the 32-bit Cortex-A9 template appropriate for Zynq-7000. For Zynq UltraScale+ parts you would use <code>zynqMP</code> instead.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>3. Import the hardware description</h2>
+<!-- /wp:heading -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-config --get-hw-description ../design_1_wrapper.xsa</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>This drops you into a menuconfig-style UI. The settings that matter for this flow are:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul>
+<li><strong>Image Packaging Configuration → Root filesystem type:</strong> <code>EXT4</code> (we want a real writable rootfs, not initramfs).</li>
+<li><strong>Image Packaging Configuration → Copy final images to tftpboot:</strong> optional; only useful if you network-boot.</li>
+<li><strong>Image Packaging Configuration → Device node of SD device:</strong> <code>/dev/mmcblk0p2</code> (matches the second partition on the SD card we will build).</li>
+<li><strong>FPGA Manager:</strong> <em>uncheck</em> this. With FPGA Manager disabled, the bitstream is programmed by the FSBL at boot, which is simpler and what we want for a fixed design.</li>
+<li><strong>DTG Settings → Kernel Bootargs → Auto generated bootargs:</strong> leave on. After this step, verify that the generated bootargs include <code>root=/dev/mmcblk0p2</code>.</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>Save and exit. Your choices are persisted to <code>project-spec/configs/config</code>.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>4. Enable UIO in the kernel</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>UIO (Userspace I/O) is how a Linux application will talk to your custom AXI peripherals. Without it, an application has no way to <code>mmap</code> a peripheral's register block.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-config -c kernel</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Navigate to <strong>Device Drivers → Userspace I/O Drivers</strong> and enable:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>&lt;*&gt; Userspace I/O platform driver with generic IRQ handling</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>This sets <code>CONFIG_UIO_PDRV_GENIRQ=y</code>. The change is written as a fragment into <code>project-spec/meta-user/recipes-kernel/linux/linux-xlnx/user_*.cfg</code>, which survives kernel upgrades.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>5. Tell the device tree which nodes are UIO</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Having the driver compiled in is not enough; each peripheral you want to bind to UIO must say so in the device tree. Edit:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>and make it look like this (adjust the peripheral labels to match your own block design):</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>/include/ "system-conf.dtsi"
+
+/ {
+    chosen {
+        bootargs = "console=ttyPS0,115200 earlycon earlyprintk root=/dev/mmcblk0p2 ro rootwait uio_pdrv_genirq.of_id=generic-uio";
+    };
+};
+
+&amp;axi_gpio_0       { compatible = "generic-uio"; };
+&amp;axi_gpio_1       { compatible = "generic-uio"; };
+&amp;axi_gpio_control { compatible = "generic-uio"; };
+&amp;axi_gpio_values  { compatible = "generic-uio"; };
+&amp;axi_fifo_mm_s_0  { compatible = "generic-uio"; };
+&amp;axi_fifo_mm_s_1  { compatible = "generic-uio"; };
+&amp;axi_dma_0        { compatible = "generic-uio"; };
+&amp;axi_dma_1        { compatible = "generic-uio"; };</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Three things have to line up for a peripheral to appear under <code>/sys/class/uio/</code> on the running board: the kernel option from step 4, the <code>uio_pdrv_genirq.of_id=generic-uio</code> kernel argument in the <code>chosen</code> node above, and the <code>compatible = "generic-uio"</code> override on each peripheral node. Miss one and the device silently does not appear.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Reference peripherals by the label the Vivado block-design instance gave them (for example <code>&amp;axi_gpio_control</code>, not <code>&amp;axi_gpio_2</code>). The device-tree generator preserves the BD instance name; positional guesses fail DTC with "Label or path not found."</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Rebuild the device tree on its own to catch syntax errors early:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-build -c device-tree</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:heading -->
+<h2>6. Configure the root filesystem</h2>
+<!-- /wp:heading -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-config -c rootfs</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>A minimal useful set of choices:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul>
+<li><strong>Image Features:</strong> <code>empty-root-password</code> and <code>serial-autologin-root</code> — convenient for bring-up. Disable both before anything leaves your lab.</li>
+<li><strong>Filesystem Packages → base → kmod:</strong> <code>kmod</code>, <code>libkmod</code>.</li>
+<li><strong>Filesystem Packages → base → shell → bash:</strong> <code>bash</code>.</li>
+<li><strong>Filesystem Packages → libs → libgpiod:</strong> <code>libgpiod</code> and <code>libgpiod-dev</code> if you plan to use the libgpiod user-space API.</li>
+<li><strong>Filesystem Packages → net:</strong> <code>tcpdump</code>, <code>openssh-server</code>.</li>
+<li><strong>User Packages:</strong> <code>gpio-demo</code>, <code>peekpoke</code> (very handy for poking AXI registers from the shell).</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>If you want the libgpiod tools (<code>gpioinfo</code>, <code>gpioset</code>, etc.) in the rootfs, also append the following line to <code>project-spec/meta-user/conf/petalinuxbsp.conf</code>:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>IMAGE_INSTALL:append = " libgpiod libgpiod-tools "</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:heading -->
+<h2>7. Build</h2>
+<!-- /wp:heading -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-build</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>The first build fetches sources and compiles the kernel, U-Boot, and every rootfs package — expect 30–60 minutes on a modern machine, longer over a slow network. Subsequent rebuilds are cached and take minutes.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>When it finishes, the outputs you care about live in <code>images/linux/</code>:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table>
+<thead><tr><th>File</th><th>Contents</th></tr></thead>
+<tbody>
+<tr><td><code>zynq_fsbl.elf</code></td><td>First-stage bootloader</td></tr>
+<tr><td><code>u-boot.elf</code></td><td>Second-stage bootloader</td></tr>
+<tr><td><code>image.ub</code></td><td>FIT image: Linux kernel + device tree</td></tr>
+<tr><td><code>system.dtb</code></td><td>Standalone compiled device tree</td></tr>
+<tr><td><code>rootfs.tar.gz</code></td><td>Compressed root filesystem</td></tr>
+</tbody>
+</table></figure>
+<!-- /wp:table -->
+
+<!-- wp:heading -->
+<h2>8. Package BOOT.BIN and the SD image</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p><code>BOOT.BIN</code> is the boot blob U-Boot and the FSBL need to find in the FAT partition of the SD card. Build it with:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-package --boot \
+  --fsbl images/linux/zynq_fsbl.elf \
+  --fpga ./components/plnx_workspace/device-tree/device-tree/design_1_wrapper.bit \
+  --u-boot images/linux/u-boot.elf --force</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Then bundle everything into a single SD-card image using the WIC tool:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>petalinux-package wic \
+  --bootfiles "BOOT.BIN image.ub system.dtb boot.scr" \
+  --rootfs-file ./images/linux/rootfs.tar.gz</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>The result is <code>images/linux/petalinux-sdimage.wic</code>. It contains two partitions: a small FAT32 boot partition with <code>BOOT.BIN</code> and <code>image.ub</code>, and an EXT4 partition with the rootfs.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>9. Burn the image to the SD card</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Insert the SD card into your host. On Linux, identify the device node:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>lsblk</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Find a device whose size matches your card (something like <code>sdb</code> with a couple of partitions <code>sdb1</code> and <code>sdb2</code>, or <code>mmcblk0</code> on a laptop). <strong>Double-check this.</strong> Writing to the wrong device will destroy whatever is on it. Unmount any partitions it has automounted:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>sudo umount /dev/sdb1 /dev/sdb2   # use your actual device</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Then flash:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>sudo dd if=images/linux/petalinux-sdimage.wic of=/dev/sdb \
+    bs=4M status=progress conv=fsync
+sync</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>On Windows or macOS, <a href="https://etcher.balena.io/">balenaEtcher</a> is the easiest path: point it at the <code>.wic</code> file and the SD card and click <em>Flash</em>.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>10. Set the Arty Z7-20 jumpers</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Two jumpers on the Arty Z7-20 decide how the board powers up and where it boots from.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:table -->
+<figure class="wp-block-table"><table>
+<thead><tr><th>Jumper</th><th>Purpose</th><th>Set to</th></tr></thead>
+<tbody>
+<tr><td><strong>JP4</strong></td><td>Boot mode (JTAG / QSPI / SD)</td><td><code>SD</code></td></tr>
+<tr><td><strong>JP5</strong></td><td>Power source (USB / external)</td><td><code>USB</code> for bench work, <code>REG</code> if you are feeding 7–15 V into the barrel jack</td></tr>
+</tbody>
+</table></figure>
+<!-- /wp:table -->
+
+<!-- wp:paragraph -->
+<p>JP4 is a three-position shunt on the board, silkscreened <code>JTAG / QSPI / SD</code>. Move the shunt so it bridges the two pins labeled <code>SD</code>. If you leave it on <code>JTAG</code> the board will sit waiting for Vivado to hand it a bitstream and never see your SD card.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Insert the SD card into the slot on the bottom of the board before you power it on.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>11. Connect the USB cable and find the serial port</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Connect the host PC to the Arty Z7-20 with a USB micro-B cable. The FT2232HQ on the Arty enumerates as <em>two</em> serial channels over the one cable — one is the JTAG interface, the other is the PS UART you want to talk to.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading {"level":3} -->
+<h3>On Linux</h3>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Before plugging in the board, run:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>ls /dev/ttyUSB*</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Note what is there. Plug in the board and re-run the same command. Two new entries will appear, typically <code>/dev/ttyUSB0</code> and <code>/dev/ttyUSB1</code>. The second of the pair — the higher-numbered one — is the UART. You can confirm with:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>sudo dmesg | tail -20
+ls -l /dev/serial/by-id/</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p><code>dmesg</code> will show <code>ftdi_sio</code> attaching and will print the two <code>ttyUSB</code> nodes it created. <code>/dev/serial/by-id/</code> gives stable, human-readable names — for example <code>usb-Digilent_Arty_Z7-20_210351B...-if01-port0</code>. The <code>-if01</code> device is the UART; <code>-if00</code> is the JTAG channel. Symlinking by-id names is a good habit if you have more than one Xilinx board on the desk.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>Your user needs to be in the <code>dialout</code> group to open the port without <code>sudo</code>:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>sudo usermod -aG dialout $USER
+# log out and back in for this to take effect</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:heading {"level":3} -->
+<h3>On Windows</h3>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Open <strong>Device Manager</strong> and expand <strong>Ports (COM &amp; LPT)</strong>. Plug in the board and watch for two new "USB Serial Port" entries, for example <code>COM5</code> and <code>COM6</code>. The higher-numbered one is the UART. If you are unsure, right-click each entry, open <strong>Properties → Details → Bus reported device description</strong>: the UART channel is <em>Interface 1</em> of the FT2232HQ.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>12. Open PuTTY</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>Launch PuTTY and fill in the <strong>Session</strong> panel:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul>
+<li><strong>Connection type:</strong> Serial</li>
+<li><strong>Serial line:</strong> <code>/dev/ttyUSB1</code> on Linux, or <code>COM6</code> (or whichever is yours) on Windows</li>
+<li><strong>Speed:</strong> <code>115200</code></li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>Then open the <strong>Connection → Serial</strong> panel and confirm:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul>
+<li>Data bits: <code>8</code></li>
+<li>Stop bits: <code>1</code></li>
+<li>Parity: <code>None</code></li>
+<li>Flow control: <code>None</code></li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>Click <strong>Open</strong>. If you prefer a CLI tool on Linux, either of these is equivalent:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>picocom -b 115200 /dev/ttyUSB1
+# or
+sudo minicom -D /dev/ttyUSB1 -b 115200</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:heading -->
+<h2>13. Power up and first boot</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>With the SD card inserted, JP4 set to <code>SD</code>, and the serial console open, press the red power button (or slide the power switch, depending on your revision). You should see, in order:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:list -->
+<ul>
+<li>FSBL banner and bitstream programming messages</li>
+<li>U-Boot prompt counting down</li>
+<li>Kernel boot log</li>
+<li>A <code>root@arty-demo:~#</code> prompt (auto-login is on because we enabled <code>serial-autologin-root</code>)</li>
+</ul>
+<!-- /wp:list -->
+
+<!-- wp:paragraph -->
+<p>If you see FSBL output but no U-Boot, the bitstream is probably programming but the <code>BOOT.BIN</code> does not contain U-Boot — re-run the <code>petalinux-package --boot</code> command with the <code>--u-boot</code> argument. If you see nothing at all, re-check JP4 and the serial port selection.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>14. Verify your peripherals came up</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>On the live system, enumerate everything the kernel bound to UIO:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>for d in /sys/class/uio/uio*; do
+    echo "$(basename $d): $(cat $d/name) @ $(cat $d/maps/map0/addr)"
+done</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>A healthy Arty Z7-20 with the example design prints something like:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>uio0: dma           @ 0x40400000
+uio1: dma           @ 0x40410000
+uio2: axi_fifo_mm_s @ 0x43c00000
+uio3: axi_fifo_mm_s @ 0x43c10000
+uio4: gpio_ctl      @ 0x41220000
+uio5: gpio_val      @ 0x41230000</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>If a peripheral you expected is missing, the fastest diagnosis is to decompile the device tree the board actually booted with and check for your node:</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:code -->
+<pre class="wp-block-code"><code>dtc -I dtb -O dts -o /tmp/final.dts /sys/firmware/fdt
+grep -A5 'your-peripheral-name' /tmp/final.dts</code></pre>
+<!-- /wp:code -->
+
+<!-- wp:paragraph -->
+<p>Note: UIO numbering (<code>uio0</code>, <code>uio1</code>, …) is <em>not</em> stable. It can change across kernel updates or device-tree edits. Any user-space program you write should look up a peripheral by its physical base address under <code>/sys/class/uio/uioN/maps/map0/addr</code>, not by the <code>/dev/uioN</code> number.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:heading -->
+<h2>Wrap-up</h2>
+<!-- /wp:heading -->
+
+<!-- wp:paragraph -->
+<p>You now have a full toolchain path from a Vivado hardware design to a self-contained Linux distribution that boots your board, programs your bitstream, and exposes every custom AXI peripheral to user space. In Part 3 we will write a small C application that <code>mmap</code>s those UIO devices and drives the FIFOs, GPIO, and DMA from user space — the software half of the same block design.</p>
+<!-- /wp:paragraph -->

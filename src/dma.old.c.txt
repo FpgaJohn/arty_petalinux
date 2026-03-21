@@ -1,0 +1,209 @@
+#include "dma.h"
+#include "util.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+static void dbg_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+}
+
+/* Translate a locked virtual address to its DDR physical address.
+ * HP0 bypasses CPU caches, so the DMA reads/writes DDR directly — we need
+ * the physical address to program the DMA source/destination registers. */
+static uint32_t virt_to_phys(void *vaddr)
+{
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) { perror("pagemap open"); return 0; }
+
+    uint64_t entry;
+    off_t off = ((uintptr_t)vaddr / (uintptr_t)page_size) * (off_t)sizeof(entry);
+    if (pread(fd, &entry, sizeof(entry), off) != (ssize_t)sizeof(entry)) {
+        perror("pagemap pread");
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    if (!(entry & (1ULL << 63))) {
+        fprintf(stderr, "virt_to_phys: page not present in RAM\n");
+        return 0;
+    }
+
+    uint64_t pfn = entry & ((1ULL << 55) - 1);
+    return (uint32_t)(pfn * (uint64_t)page_size +
+                      ((uintptr_t)vaddr & (uintptr_t)(page_size - 1)));
+}
+
+/* Clean + invalidate D-cache for a virtual range.
+ * Required because HP0 is not cache-coherent: DMA reads/writes DDR directly,
+ * bypassing L1/L2. Without this, MM2S may read stale cache instead of our TX
+ * data, and S2MM results in DDR may not appear in CPU-visible cache. */
+static void cache_flush(void *start, size_t len)
+{
+    __builtin___clear_cache((char *)start, (char *)start + len);
+}
+
+int dma_open(dma_dev_t *dev, uint32_t addr)
+{
+    char path[32];
+
+    if (uio_find_by_addr(addr, path, sizeof(path)) < 0) {
+        fprintf(stderr, "Cannot find DMA UIO at 0x%08X\n", addr);
+        return -1;
+    }
+    dbg_printf("DMA @ 0x%08X -> %s\n", addr, path);
+
+    dev->fd = open(path, O_RDWR);
+    if (dev->fd < 0) { perror("open"); return -1; }
+
+    dev->regs = (volatile uint32_t *)mmap(NULL, DMA_MAP_SIZE,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd, 0);
+    if (dev->regs == MAP_FAILED) { perror("mmap"); return -1; }
+
+    dbg_printf("[DBG] dma_open: regs @ %p\n", (void *)dev->regs);
+    return 0;
+}
+
+void dma_close(dma_dev_t *dev)
+{
+    munmap((void *)dev->regs, DMA_MAP_SIZE);
+    close(dev->fd);
+}
+
+void dma_reset(dma_dev_t *dev)
+{
+    dev->regs[DMA_MM2S_DMACR / 4] = DMA_CR_RESET;
+    for (int i = 0; i < 1000 && (dev->regs[DMA_MM2S_DMACR / 4] & DMA_CR_RESET); i++)
+        usleep(10);
+
+    dev->regs[DMA_S2MM_DMACR / 4] = DMA_CR_RESET;
+    for (int i = 0; i < 1000 && (dev->regs[DMA_S2MM_DMACR / 4] & DMA_CR_RESET); i++)
+        usleep(10);
+
+    dbg_printf("[DBG] dma_reset: done\n");
+}
+
+void dma_print_status(dma_dev_t *dev, const char *label)
+{
+    printf("--- %s ---\n", label);
+    printf("  MM2S SR: 0x%08X\n", dev->regs[DMA_MM2S_DMASR / 4]);
+    printf("  S2MM SR: 0x%08X\n", dev->regs[DMA_S2MM_DMASR / 4]);
+    fflush(stdout);
+}
+
+static int wait_idle(volatile uint32_t *sr_reg, uint32_t timeout_ms,
+                     const char *name)
+{
+    for (uint32_t ms = 0; ms < timeout_ms; ms++) {
+        uint32_t sr = *sr_reg;
+        if (sr & DMA_SR_IDLE)   return 0;
+        if (sr & DMA_SR_HALTED) {
+            fprintf(stderr, "%s halted: SR=0x%08X\n", name, sr);
+            return -1;
+        }
+        usleep(1000);
+    }
+    fprintf(stderr, "%s timeout: SR=0x%08X\n", name, *sr_reg);
+    return -1;
+}
+
+int dma_main(uint32_t dma_addr)
+{
+    dma_dev_t dma;
+    uint32_t *tx_buf = NULL;
+    uint32_t *rx_buf = NULL;
+    int ret = 0;
+
+    printf("- dma_open\n");
+    if (dma_open(&dma, dma_addr) < 0) return -1;
+
+    printf("- dma_reset\n");
+    dma_reset(&dma);
+    dma_print_status(&dma, "after reset");
+
+    const uint32_t num_words = DMA_BUF_WORDS;
+    const uint32_t len_bytes = num_words * sizeof(uint32_t);
+
+    if (posix_memalign((void **)&tx_buf, 64, len_bytes) != 0 ||
+        posix_memalign((void **)&rx_buf, 64, len_bytes) != 0) {
+        perror("posix_memalign");
+        ret = -1;
+        goto cleanup;
+    }
+
+    for (uint32_t i = 0; i < num_words; i++)
+        tx_buf[i] = 0xA0000000 | i;
+    memset(rx_buf, 0, len_bytes);
+
+    /* Lock pages — required before reading /proc/self/pagemap */
+    if (mlock(tx_buf, len_bytes) < 0 || mlock(rx_buf, len_bytes) < 0) {
+        perror("mlock");
+        ret = -1;
+        goto cleanup;
+    }
+
+    uint32_t tx_phys = virt_to_phys(tx_buf);
+    uint32_t rx_phys = virt_to_phys(rx_buf);
+    if (!tx_phys || !rx_phys) { ret = -1; goto cleanup; }
+
+    printf("\nWriting %u 32-bit words via DMA loopback...\n", num_words);
+    for (uint32_t i = 0; i < num_words; i++)
+        printf("  tx[%u] = 0x%08X\n", i, tx_buf[i]);
+
+    dbg_printf("[DBG] tx_phys=0x%08X rx_phys=0x%08X len=%u\n",
+               tx_phys, rx_phys, len_bytes);
+
+    /* Flush TX out of D-cache so DMA (HP0) reads current data from DDR.
+     * Invalidate RX so we don't read stale lines after S2MM completes. */
+    cache_flush(tx_buf, len_bytes);
+    cache_flush(rx_buf, len_bytes);
+
+    /* Arm S2MM first — set destination and length before MM2S sends data.
+     * axis_data_fifo provides some buffering, but ordering is still safest. */
+    dma.regs[DMA_S2MM_DMACR / 4] = DMA_CR_RS;
+    dma.regs[DMA_S2MM_DA     / 4] = rx_phys;
+    dma.regs[DMA_S2MM_LENGTH / 4] = len_bytes;
+
+    /* Trigger MM2S transfer */
+    dma.regs[DMA_MM2S_DMACR / 4] = DMA_CR_RS;
+    dma.regs[DMA_MM2S_SA     / 4] = tx_phys;
+    dma.regs[DMA_MM2S_LENGTH / 4] = len_bytes;
+
+    printf("\nWaiting for DMA to complete...\n");
+    if (wait_idle(&dma.regs[DMA_MM2S_DMASR / 4], 1000, "MM2S") < 0) { ret = -1; goto cleanup; }
+    if (wait_idle(&dma.regs[DMA_S2MM_DMASR / 4], 1000, "S2MM") < 0) { ret = -1; goto cleanup; }
+
+    dma_print_status(&dma, "after transfer");
+
+    /* Invalidate RX cache so CPU reads what DMA wrote to DDR, not stale lines */
+    cache_flush(rx_buf, len_bytes);
+
+    printf("\nReceived %u 32-bit words:\n", num_words);
+    int pass = 1;
+    for (uint32_t i = 0; i < num_words; i++) {
+        int match = (rx_buf[i] == tx_buf[i]);
+        printf("  rx[%u] = 0x%08X %s\n", i, rx_buf[i], match ? "OK" : "MISMATCH");
+        if (!match) pass = 0;
+    }
+
+    printf("\nResult: %s\n", pass ? "PASS" : "FAIL");
+
+cleanup:
+    free(tx_buf);
+    free(rx_buf);
+    dma_close(&dma);
+    return ret;
+}

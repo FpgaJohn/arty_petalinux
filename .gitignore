@@ -1,0 +1,45 @@
+
+*/*/config.old
+*/*/rootfs_config.old
+build/
+images/linux/
+pre-built/linux/
+.petalinux/*
+!.petalinux/metadata
+*.o
+*.jou
+*.log
+components/plnx_workspace
+components/yocto
+
+# PetaLinux generated output
+build/
+images/
+pre-built/
+tmp/
+.cache/
+cache/
+
+# Logs
+*.log
+*.jou
+*.str
+
+# Generated boot/images
+*.wic
+*.wic.gz
+*.tar.gz
+*.cpio
+*.cpio.gz
+*.ub
+*.ext4
+BOOT.BIN
+image.ub
+
+# SDK installers
+*.sh
+
+# Editor junk
+*~
+.*.swp
+.vscode/
