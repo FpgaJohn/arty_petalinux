@@ -1,0 +1,378 @@
+================================================================================
+Part 2: From XSA to Booted Linux on the Arty Z7-20
+================================================================================
+
+In Part 1 we built a Vivado 2024.1 block design for the Digilent Arty Z7-20 and
+exported a hardware description (design_1_wrapper.xsa). That .xsa is the bridge
+between the FPGA side of the Zynq-7000 and the software side -- it tells
+PetaLinux where every AXI peripheral lives, which interrupts are wired, and
+what the processor system looks like. In this article we turn that file into a
+booting Linux distribution on an SD card, wire up the board, and log in over a
+serial console.
+
+Everything below assumes PetaLinux 2024.1 on an Ubuntu-family host and a
+Digilent Arty Z7-20 (Xilinx XC7Z020). The same flow works for the Arty Z7-10
+with a different .xsa.
+
+
+Prerequisites
+-------------
+
+- PetaLinux 2024.1 installed under /tools/Xilinx/PetaLinux/2024.1 (adjust paths
+  if yours differs).
+- A design_1_wrapper.xsa from Part 1, containing at least the peripherals you
+  want to drive from Linux.
+- A microSD card (8 GB or larger, Class 10 recommended).
+- A USB micro-B cable -- the Arty Z7-20 uses a single USB connection for both
+  JTAG and UART through an FTDI FT2232HQ.
+- PuTTY (Windows) or minicom/picocom/screen (Linux/macOS).
+
+
+1. Source the PetaLinux tools
+-----------------------------
+
+Every PetaLinux command needs the tool environment loaded first. Open a fresh
+shell and run:
+
+    . /tools/Xilinx/PetaLinux/2024.1/settings.sh
+
+If you close this terminal you will need to source settings.sh again in the
+next one. A common mistake is running petalinux-build in a new window and
+getting "command not found" -- that just means you forgot this step.
+
+
+2. Create the PetaLinux project
+-------------------------------
+
+Place your design_1_wrapper.xsa somewhere convenient -- say
+~/work/arty_petalinux/ -- and create a new project alongside it:
+
+    cd ~/work/arty_petalinux
+    petalinux-create project --template zynq --name arty_demo
+    cd arty_demo
+
+The --template zynq flag matters: it selects the 32-bit Cortex-A9 template
+appropriate for Zynq-7000. For Zynq UltraScale+ parts you would use zynqMP
+instead.
+
+
+3. Import the hardware description
+----------------------------------
+
+    petalinux-config --get-hw-description ../design_1_wrapper.xsa
+
+This drops you into a menuconfig-style UI. The settings that matter for this
+flow are:
+
+- Image Packaging Configuration -> Root filesystem type: EXT4 (we want a real
+  writable rootfs, not initramfs).
+- Image Packaging Configuration -> Copy final images to tftpboot: optional;
+  only useful if you network-boot.
+- Image Packaging Configuration -> Device node of SD device: /dev/mmcblk0p2
+  (matches the second partition on the SD card we will build).
+- FPGA Manager: uncheck this. With FPGA Manager disabled, the bitstream is
+  programmed by the FSBL at boot, which is simpler and what we want for a
+  fixed design.
+- DTG Settings -> Kernel Bootargs -> Auto generated bootargs: leave on. After
+  this step, verify that the generated bootargs include root=/dev/mmcblk0p2.
+
+Save and exit. Your choices are persisted to project-spec/configs/config.
+
+
+4. Enable UIO in the kernel
+---------------------------
+
+UIO (Userspace I/O) is how a Linux application will talk to your custom AXI
+peripherals. Without it, an application has no way to mmap a peripheral's
+register block.
+
+    petalinux-config -c kernel
+
+Navigate to Device Drivers -> Userspace I/O Drivers and enable:
+
+    <*> Userspace I/O platform driver with generic IRQ handling
+
+This sets CONFIG_UIO_PDRV_GENIRQ=y. The change is written as a fragment into
+project-spec/meta-user/recipes-kernel/linux/linux-xlnx/user_*.cfg, which
+survives kernel upgrades.
+
+
+5. Tell the device tree which nodes are UIO
+-------------------------------------------
+
+Having the driver compiled in is not enough; each peripheral you want to bind
+to UIO must say so in the device tree. Edit:
+
+    project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi
+
+and make it look like this (adjust the peripheral labels to match your own
+block design):
+
+    /include/ "system-conf.dtsi"
+
+    / {
+        chosen {
+            bootargs = "console=ttyPS0,115200 earlycon earlyprintk root=/dev/mmcblk0p2 ro rootwait uio_pdrv_genirq.of_id=generic-uio";
+        };
+    };
+
+    &axi_gpio_0       { compatible = "generic-uio"; };
+    &axi_gpio_1       { compatible = "generic-uio"; };
+    &axi_gpio_control { compatible = "generic-uio"; };
+    &axi_gpio_values  { compatible = "generic-uio"; };
+    &axi_fifo_mm_s_0  { compatible = "generic-uio"; };
+    &axi_fifo_mm_s_1  { compatible = "generic-uio"; };
+    &axi_dma_0        { compatible = "generic-uio"; };
+    &axi_dma_1        { compatible = "generic-uio"; };
+
+Three things have to line up for a peripheral to appear under /sys/class/uio/
+on the running board: the kernel option from step 4, the
+uio_pdrv_genirq.of_id=generic-uio kernel argument in the chosen node above,
+and the compatible = "generic-uio" override on each peripheral node. Miss one
+and the device silently does not appear.
+
+Reference peripherals by the label the Vivado block-design instance gave them
+(for example &axi_gpio_control, not &axi_gpio_2). The device-tree generator
+preserves the BD instance name; positional guesses fail DTC with "Label or
+path not found."
+
+Rebuild the device tree on its own to catch syntax errors early:
+
+    petalinux-build -c device-tree
+
+
+6. Configure the root filesystem
+--------------------------------
+
+    petalinux-config -c rootfs
+
+A minimal useful set of choices:
+
+- Image Features: empty-root-password and serial-autologin-root -- convenient
+  for bring-up. Disable both before anything leaves your lab.
+- Filesystem Packages -> base -> kmod: kmod, libkmod.
+- Filesystem Packages -> base -> shell -> bash: bash.
+- Filesystem Packages -> libs -> libgpiod: libgpiod and libgpiod-dev if you
+  plan to use the libgpiod user-space API.
+- Filesystem Packages -> net: tcpdump, openssh-server.
+- User Packages: gpio-demo, peekpoke (very handy for poking AXI registers
+  from the shell).
+
+If you want the libgpiod tools (gpioinfo, gpioset, etc.) in the rootfs, also
+append the following line to project-spec/meta-user/conf/petalinuxbsp.conf:
+
+    IMAGE_INSTALL:append = " libgpiod libgpiod-tools "
+
+
+7. Build
+--------
+
+    petalinux-build
+
+The first build fetches sources and compiles the kernel, U-Boot, and every
+rootfs package -- expect 30-60 minutes on a modern machine, longer over a slow
+network. Subsequent rebuilds are cached and take minutes.
+
+When it finishes, the outputs you care about live in images/linux/:
+
+    File             Contents
+    ---------------- -----------------------------------------------
+    zynq_fsbl.elf    First-stage bootloader
+    u-boot.elf       Second-stage bootloader
+    image.ub         FIT image: Linux kernel + device tree
+    system.dtb       Standalone compiled device tree
+    rootfs.tar.gz    Compressed root filesystem
+
+
+8. Package BOOT.BIN and the SD image
+------------------------------------
+
+BOOT.BIN is the boot blob U-Boot and the FSBL need to find in the FAT
+partition of the SD card. Build it with:
+
+    petalinux-package --boot \
+      --fsbl images/linux/zynq_fsbl.elf \
+      --fpga ./components/plnx_workspace/device-tree/device-tree/design_1_wrapper.bit \
+      --u-boot images/linux/u-boot.elf --force
+
+Then bundle everything into a single SD-card image using the WIC tool:
+
+    petalinux-package wic \
+      --bootfiles "BOOT.BIN image.ub system.dtb boot.scr" \
+      --rootfs-file ./images/linux/rootfs.tar.gz
+
+The result is images/linux/petalinux-sdimage.wic. It contains two partitions:
+a small FAT32 boot partition with BOOT.BIN and image.ub, and an EXT4 partition
+with the rootfs.
+
+
+9. Burn the image to the SD card
+--------------------------------
+
+Insert the SD card into your host. On Linux, identify the device node:
+
+    lsblk
+
+Find a device whose size matches your card (something like sdb with a couple
+of partitions sdb1 and sdb2, or mmcblk0 on a laptop). DOUBLE-CHECK THIS.
+Writing to the wrong device will destroy whatever is on it. Unmount any
+partitions it has automounted:
+
+    sudo umount /dev/sdb1 /dev/sdb2   # use your actual device
+
+Then flash:
+
+    sudo dd if=images/linux/petalinux-sdimage.wic of=/dev/sdb \
+        bs=4M status=progress conv=fsync
+    sync
+
+On Windows or macOS, balenaEtcher (https://etcher.balena.io/) is the easiest
+path: point it at the .wic file and the SD card and click Flash.
+
+
+10. Set the Arty Z7-20 jumpers
+------------------------------
+
+Two jumpers on the Arty Z7-20 decide how the board powers up and where it
+boots from.
+
+    Jumper  Purpose                            Set to
+    ------  --------------------------------   ---------------------------
+    JP4     Boot mode (JTAG / QSPI / SD)       SD
+    JP5     Power source (USB / external)      USB for bench work, REG if
+                                               you are feeding 7-15 V into
+                                               the barrel jack
+
+JP4 is a three-position shunt on the board, silkscreened JTAG / QSPI / SD.
+Move the shunt so it bridges the two pins labeled SD. If you leave it on
+JTAG the board will sit waiting for Vivado to hand it a bitstream and never
+see your SD card.
+
+Insert the SD card into the slot on the bottom of the board before you power
+it on.
+
+
+11. Connect the USB cable and find the serial port
+--------------------------------------------------
+
+Connect the host PC to the Arty Z7-20 with a USB micro-B cable. The FT2232HQ
+on the Arty enumerates as TWO serial channels over the one cable -- one is
+the JTAG interface, the other is the PS UART you want to talk to.
+
+On Linux:
+
+Before plugging in the board, run:
+
+    ls /dev/ttyUSB*
+
+Note what is there. Plug in the board and re-run the same command. Two new
+entries will appear, typically /dev/ttyUSB0 and /dev/ttyUSB1. The second of
+the pair -- the higher-numbered one -- is the UART. You can confirm with:
+
+    sudo dmesg | tail -20
+    ls -l /dev/serial/by-id/
+
+dmesg will show ftdi_sio attaching and will print the two ttyUSB nodes it
+created. /dev/serial/by-id/ gives stable, human-readable names -- for example
+usb-Digilent_Arty_Z7-20_210351B...-if01-port0. The -if01 device is the UART;
+-if00 is the JTAG channel. Symlinking by-id names is a good habit if you
+have more than one Xilinx board on the desk.
+
+Your user needs to be in the dialout group to open the port without sudo:
+
+    sudo usermod -aG dialout $USER
+    # log out and back in for this to take effect
+
+On Windows:
+
+Open Device Manager and expand Ports (COM & LPT). Plug in the board and
+watch for two new "USB Serial Port" entries, for example COM5 and COM6. The
+higher-numbered one is the UART. If you are unsure, right-click each entry,
+open Properties -> Details -> Bus reported device description: the UART
+channel is Interface 1 of the FT2232HQ.
+
+
+12. Open PuTTY
+--------------
+
+Launch PuTTY and fill in the Session panel:
+
+- Connection type: Serial
+- Serial line: /dev/ttyUSB1 on Linux, or COM6 (or whichever is yours) on
+  Windows
+- Speed: 115200
+
+Then open the Connection -> Serial panel and confirm:
+
+- Data bits: 8
+- Stop bits: 1
+- Parity: None
+- Flow control: None
+
+Click Open. If you prefer a CLI tool on Linux, either of these is
+equivalent:
+
+    picocom -b 115200 /dev/ttyUSB1
+    # or
+    sudo minicom -D /dev/ttyUSB1 -b 115200
+
+
+13. Power up and first boot
+---------------------------
+
+With the SD card inserted, JP4 set to SD, and the serial console open, press
+the red power button (or slide the power switch, depending on your revision).
+You should see, in order:
+
+- FSBL banner and bitstream programming messages
+- U-Boot prompt counting down
+- Kernel boot log
+- A root@arty-demo:~# prompt (auto-login is on because we enabled
+  serial-autologin-root)
+
+If you see FSBL output but no U-Boot, the bitstream is probably programming
+but the BOOT.BIN does not contain U-Boot -- re-run the petalinux-package
+--boot command with the --u-boot argument. If you see nothing at all,
+re-check JP4 and the serial port selection.
+
+
+14. Verify your peripherals came up
+-----------------------------------
+
+On the live system, enumerate everything the kernel bound to UIO:
+
+    for d in /sys/class/uio/uio*; do
+        echo "$(basename $d): $(cat $d/name) @ $(cat $d/maps/map0/addr)"
+    done
+
+A healthy Arty Z7-20 with the example design prints something like:
+
+    uio0: dma           @ 0x40400000
+    uio1: dma           @ 0x40410000
+    uio2: axi_fifo_mm_s @ 0x43c00000
+    uio3: axi_fifo_mm_s @ 0x43c10000
+    uio4: gpio_ctl      @ 0x41220000
+    uio5: gpio_val      @ 0x41230000
+
+If a peripheral you expected is missing, the fastest diagnosis is to
+decompile the device tree the board actually booted with and check for your
+node:
+
+    dtc -I dtb -O dts -o /tmp/final.dts /sys/firmware/fdt
+    grep -A5 'your-peripheral-name' /tmp/final.dts
+
+Note: UIO numbering (uio0, uio1, ...) is NOT stable. It can change across
+kernel updates or device-tree edits. Any user-space program you write should
+look up a peripheral by its physical base address under
+/sys/class/uio/uioN/maps/map0/addr, not by the /dev/uioN number.
+
+
+Wrap-up
+-------
+
+You now have a full toolchain path from a Vivado hardware design to a
+self-contained Linux distribution that boots your board, programs your
+bitstream, and exposes every custom AXI peripheral to user space. In Part 3
+we will write a small C application that mmaps those UIO devices and drives
+the FIFOs, GPIO, and DMA from user space -- the software half of the same
+block design.
